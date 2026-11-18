@@ -11,7 +11,10 @@
 // and that it is no bigger than 1 MiB. The copy goes through a temporary
 // file in the destination directory and is renamed into place, so a reader
 // never sees a half-written file; afterwards the SHA-256 of what landed on
-// disk is compared against the source, and any mismatch aborts loudly.
+// disk is compared against the source, and any mismatch aborts loudly;
+// the delivered file is also checked to end with a well-formed IEND
+// chunk, so a truncated copy is caught even if its size and hash somehow
+// still lined up.
 
 import { createHash } from "node:crypto";
 import {
@@ -67,6 +70,54 @@ function sha256(data) {
   return createHash("sha256").update(data).digest("hex");
 }
 
+// CRC-32 (IEEE) of a buffer, used to check the IEND chunk's CRC.
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (const byte of buf) {
+    crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// A whole PNG ends with a 12-byte IEND chunk: a zero length field, the
+// four type bytes "IEND", and a CRC over those type bytes. A file that was
+// cut short mid-write loses that trailer, so checking it here proves the
+// delivered file is complete, not just the right length and hash.
+function checkPngIend(buf) {
+  if (buf.length < 12) {
+    abort("delivered file is too short to hold a PNG IEND chunk");
+  }
+  const tail = buf.subarray(buf.length - 12);
+  if (u32be(tail, 0) !== 0) {
+    abort(
+      `delivered file's trailing chunk has length ${u32be(tail, 0)}, ` +
+        "not the 0 of an IEND chunk",
+    );
+  }
+  if (tail.subarray(4, 8).toString("ascii") !== "IEND") {
+    abort(
+      "delivered file does not end with an IEND chunk " +
+        `(trailing type is ${tail.subarray(4, 8).toString("ascii")})`,
+    );
+  }
+  const expectedCrc = crc32(Buffer.from("IEND", "ascii"));
+  if (u32be(tail, 8) !== expectedCrc) {
+    abort("delivered file's IEND chunk has a bad CRC");
+  }
+}
+
 function main() {
   const here = dirname(fileURLToPath(import.meta.url));
   const sourcePath = resolve(here, "entry.png");
@@ -112,6 +163,7 @@ function main() {
   if (sha256(delivered) !== sha256(source)) {
     abort("SHA-256 of the delivered file does not match the source");
   }
+  checkPngIend(delivered);
 
   console.log(
     `wrote ${outPath} (${width}x${height}, ${delivered.length} bytes, ` +
